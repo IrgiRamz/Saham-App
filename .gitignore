@@ -1,0 +1,54 @@
+# ===== Secrets & kredensial — JANGAN PERNAH KE-PUSH =====
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials*
+*secret*
+token*
+config/secrets*
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+.ipynb_checkpoints/
+*.log
+
+# ===== Node.js =====
+node_modules/
+dist/
+build/
+.npm/
+
+# ===== Laravel / PHP =====
+/vendor/
+storage/logs/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+bootstrap/cache/*
+.phpunit.result.cache
+
+# ===== Data & database lokal =====
+*.sqlite
+*.sqlite3
+*.db
+*.csv.bak
+data/cache/
+cache/
+
+# ===== OS & editor =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ===== Output bot lokal =====
+logs/
+output/
+*.log
