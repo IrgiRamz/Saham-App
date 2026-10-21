@@ -30,6 +30,15 @@ class TestWARequest(BaseModel):
     phone: Optional[str] = None
     message: Optional[str] = "Tes koneksi GoWA dari Saham App"
 
+def verify_cron_key(x_cron_key: Optional[str]):
+    """Fail-closed: tanpa SECRET_CRON_KEY terkonfigurasi di .env, semua request ditolak."""
+    if not settings.SECRET_CRON_KEY or not x_cron_key or x_cron_key != settings.SECRET_CRON_KEY:
+        logger.warning("Percobaan akses tanpa X-Cron-Key yang valid.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Header 'X-Cron-Key' tidak valid atau tidak disertakan."
+        )
+
 async def process_stock_scan_background():
     """
     Background task untuk meloloskan screening dan mengirimkan notifikasi ke GoWA.
@@ -52,6 +61,13 @@ async def process_stock_scan_background():
         # Check 3: Sinyal Terkualifikasi Ditemukan -> Pengiriman Notifikasi WA
         logger.info(f"Mengirimkan {len(signals)} notifikasi sinyal ke WhatsApp...")
         for sig in signals:
+            # RRR dihitung dari level aktual (setelah pembulatan tick & clamping),
+            # bukan diklaim hardcoded — angka di pesan harus sama dengan yang diverifikasi kode.
+            rrr = (sig['tp_percent'] / abs(sig['sl_percent'])) if sig.get('sl_percent') else 0.0
+            resistance_line = ""
+            if sig.get('resistance'):
+                resistance_line = f"- Resistance Terdekat: Rp {sig['resistance']:,.0f} (ruang naik {sig.get('resistance_room_pct', 0):.1f}%)\n"
+            fundamental_line = f"- Fundamental: {sig.get('fundamental_status', 'tidak terverifikasi')}\n"
             msg = (
                 f"🚨 *SINYAL SWING TRADING BEI (TOP 3)* 🚨\n\n"
                 f"📌 *Ticker:* {sig['ticker']}\n"
@@ -60,13 +76,16 @@ async def process_stock_scan_background():
                 f"⚡ *Volatilitas (ATR 14):* {sig['atr']:,.0f} poin\n"
                 f"💰 *Turnover Harian:* Rp {sig['turnover']/1e9:.2f} Miliar\n\n"
                 f"📊 *Indikator Technical:*\n"
-                f"- Trend: Close > MA20 (Rp {sig['ma20']:,.0f}) > MA50 (Rp {sig['ma50']:,.0f})\n"
-                f"- RSI(14): {sig['rsi14']:.2f} (Zona Sweet Spot 42-56)\n"
-                f"- Volume Trend: Vol MA5 ({sig['vol_ma5']/100:,.0f} lot) > Vol MA20 ({sig['vol_ma20']/100:,.0f} lot)\n\n"
-                f"🎯 *Plan Trading (Risk:Reward 1:2):*\n"
+                f"- Trend: Close (Rp {sig['close']:,.0f}) > MA20 (Rp {sig['ma20']:,.0f}) > MA50 (Rp {sig['ma50']:,.0f})\n"
+                f"- RSI(14): {sig['rsi14']:.2f} (Syarat Lolos: 42-56)\n"
+                f"- Volume Trend: Vol MA5 ({sig['vol_ma5']/100:,.0f} lot) > Vol MA20 ({sig['vol_ma20']/100:,.0f} lot)\n"
+                f"{resistance_line}"
+                f"{fundamental_line}\n"
+                f"🎯 *Plan Trading:*\n"
                 f"- 🛡️ *Stop Loss:* Rp {sig['stop_loss']:,.0f} ({sig['sl_percent']:.1f}%)\n"
                 f"- 🚀 *Target Profit:* Rp {sig['take_profit']:,.0f} (+{sig['tp_percent']:.1f}%)\n"
-                f"- ⚖️ *Risk/Reward Ratio:* 1 : 2\n\n"
+                f"- ⚖️ *Risk/Reward Ratio Aktual:* 1 : {rrr:.1f}\n\n"
+                f"⚠️ *Validasi Pagi 09:15 WAJIB:* batalkan bila gap up > +2.5% atau gap down < -2.0%.\n"
                 f"⏰ *Tanggal Data:* {sig['date']}"
             )
             
@@ -78,12 +97,10 @@ async def process_stock_scan_background():
 
 @app.get("/")
 def read_root():
+    # Jangan bocorkan nomor target, URL gateway, atau device id ke publik.
     return {
         "app": "Saham App - BEI Swing Signal Detector",
-        "status": "running",
-        "gowa_target_phone": settings.GOWA_TARGET_PHONE,
-        "gowa_url": settings.GOWA_URL,
-        "gowa_device_id": settings.GOWA_DEVICE_ID
+        "status": "running"
     }
 
 @app.get("/health")
@@ -91,8 +108,14 @@ def health_check():
     return {"status": "healthy"}
 
 @app.post("/api/v1/test-wa")
-async def test_whatsapp_connection(body: Optional[TestWARequest] = None):
-    """Endpoint mandiri (Quick Test) untuk menguji koneksi & pengiriman pesan WhatsApp via GoWA."""
+async def test_whatsapp_connection(
+    body: Optional[TestWARequest] = None,
+    x_cron_key: str = Header(None, alias="X-Cron-Key")
+):
+    """Endpoint mandiri (Quick Test) untuk menguji koneksi & pengiriman pesan WhatsApp via GoWA.
+    Dilindungi X-Cron-Key yang sama dengan endpoint scan — tanpa ini siapa pun
+    bisa memakai gateway untuk mengirim WA ke nomor mana pun."""
+    verify_cron_key(x_cron_key)
     phone = (body.phone if body and body.phone else None) or settings.GOWA_TARGET_PHONE
     msg = (body.message if body and body.message else None) or "Tes koneksi GoWA dari Saham App"
 
@@ -121,12 +144,7 @@ def trigger_stock_scan(
     Endpoint HTTP untuk memicu scanning saham BEI secara non-blocking via BackgroundTasks.
     Proteksi sederhana dengan Header 'X-Cron-Key'.
     """
-    if not x_cron_key or x_cron_key != settings.SECRET_CRON_KEY:
-        logger.warning("Percobaan trigger scan tanpa X-Cron-Key yang valid.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Header 'X-Cron-Key' tidak valid atau tidak disertakan."
-        )
+    verify_cron_key(x_cron_key)
 
     background_tasks.add_task(process_stock_scan_background)
 
