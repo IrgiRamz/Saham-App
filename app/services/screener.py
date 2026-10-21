@@ -58,20 +58,55 @@ def calculate_atr_fallback(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
+def check_fundamental_safety(ticker: str) -> Dict[str, Any]:
+    """
+    Filter keamanan fundamental dasar (SPEC bagian 5): emiten harus
+    mencatatkan laba (PER/trailingPE positif) dan DER < 2.
+    Yahoo 'debtToEquity' dilaporkan dalam persen (mis. 45.0 = DER 0.45).
+
+    Hanya dipanggil untuk kandidat yang SUDAH lolos semua filter teknikal,
+    jadi jumlah panggilan network kecil. Bila data tidak tersedia dari
+    Yahoo, kandidat TIDAK ditolak, tetapi ditandai 'tidak terverifikasi'
+    agar statusnya jujur terlihat di notifikasi WA.
+    """
+    try:
+        info = yf.Ticker(ticker).info or {}
+        pe = info.get("trailingPE")
+        de_pct = info.get("debtToEquity")
+        der = (float(de_pct) / 100.0) if de_pct is not None else None
+
+        if pe is not None and float(pe) <= 0:
+            return {"ok": False, "status": f"DITOLAK fundamental: PER {float(pe):.1f} (tidak laba)"}
+        if der is not None and der >= 2.0:
+            return {"ok": False, "status": f"DITOLAK fundamental: DER {der:.2f} >= 2"}
+
+        if pe is not None or der is not None:
+            pe_txt = f"PER {float(pe):.1f}" if pe is not None else "PER n/a"
+            der_txt = f"DER {der:.2f}" if der is not None else "DER n/a"
+            return {"ok": True, "status": f"Lolos ({pe_txt}, {der_txt})"}
+        return {"ok": True, "status": "tidak terverifikasi (data Yahoo kosong)"}
+    except Exception as exc:
+        logger.warning(f"Cek fundamental {ticker} gagal: {exc}")
+        return {"ok": True, "status": "tidak terverifikasi (gagal ambil data)"}
+
 def check_market_regime() -> Dict[str, Any]:
     """
     Memeriksa kesehatan indeks IHSG (^JKSE) sebelum screening saham individu.
-    Kondisi Pasar Berisiko / Bearish:
-    1. IHSG Close < MA20 DAN MA20 < MA50 (Terkonfirmasi Downtrend).
+    Kondisi Pasar Berisiko / Bearish (sesuai SPEC):
+    1. IHSG Close < MA20 DAN Close < MA50 (Terkonfirmasi Downtrend).
     2. Perubahan harga IHSG hari ini < -1.5% (Anjlok tajam).
+
+    FAIL-CLOSED: bila data IHSG tidak dapat diambil/diverifikasi, fungsi ini
+    mengembalikan is_bearish=True. Circuit breaker yang gagal cek harus
+    DIAM (silent mode), bukan meloloskan screening dengan asumsi netral.
     """
     logger.info("Memeriksa Market Regime IHSG (^JKSE)...")
     try:
         ticker = yf.Ticker("^JKSE")
         df = ticker.history(period="3mo")
         if df.empty or len(df) < 50:
-            logger.warning("Data IHSG (^JKSE) tidak mencukupi (<50 baris). Melanjutkan screening (Asumsi Netral).")
-            return {"is_bearish": False}
+            logger.warning("Data IHSG (^JKSE) tidak mencukupi (<50 baris). FAIL-CLOSED: silent mode aktif.")
+            return {"is_bearish": True, "reason": "Data IHSG tidak mencukupi - tidak dapat diverifikasi (fail-closed)"}
 
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA50'] = df['Close'].rolling(window=50).mean()
@@ -86,7 +121,7 @@ def check_market_regime() -> Dict[str, Any]:
 
         change_percent = ((ihsg_close - prev_close) / prev_close) * 100.0
 
-        is_downtrend = (ihsg_close < ihsg_ma20) and (ihsg_ma20 < ihsg_ma50)
+        is_downtrend = (ihsg_close < ihsg_ma20) and (ihsg_close < ihsg_ma50)
         is_sharp_drop = change_percent < -1.5
 
         is_bearish = is_downtrend or is_sharp_drop
@@ -122,8 +157,8 @@ def check_market_regime() -> Dict[str, Any]:
             "date": date_str
         }
     except Exception as exc:
-        logger.warning(f"Gagal mengambil data IHSG (^JKSE): {exc}. Melanjutkan screening (Asumsi Netral).")
-        return {"is_bearish": False}
+        logger.warning(f"Gagal mengambil data IHSG (^JKSE): {exc}. FAIL-CLOSED: silent mode aktif.")
+        return {"is_bearish": True, "reason": f"Data IHSG gagal diambil ({exc}) - tidak dapat diverifikasi (fail-closed)"}
 
 def get_all_idx_tickers() -> List[str]:
     """Mengambil daftar emiten BEI dari file lokal 'data/idx_tickers.json' atau URL remote."""
@@ -193,8 +228,8 @@ class StockScreener:
             logger.debug(f"[REJECT] {ticker}: Harga Close (Rp {close:,.0f}) < Rp 100")
             return None
 
-        # 2. Hard Filter: Turnover Minimal Rp 1.5 Miliar
-        min_turnover_threshold = min(self.min_turnover, 1_500_000_000.0)
+        # 2. Hard Filter: Turnover Minimal Rp 3 Miliar (SPEC — tanpa penurunan ambang)
+        min_turnover_threshold = self.min_turnover
         if turnover < min_turnover_threshold:
             logger.debug(f"[REJECT] {ticker}: Turnover Rp {turnover:,.0f} < Rp {min_turnover_threshold:,.0f}")
             return None
@@ -209,8 +244,8 @@ class StockScreener:
         candle_range = high - low
         if candle_range > 0:
             close_ratio = (close - low) / candle_range
-            if close_ratio < 0.45:
-                logger.debug(f"[REJECT] {ticker}: Tekanan jual atas tinggi (Close ratio {close_ratio:.2f} < 0.45)")
+            if close_ratio < 0.55:
+                logger.debug(f"[REJECT] {ticker}: Tekanan jual atas tinggi (Close ratio {close_ratio:.2f} < 0.55)")
                 return None
         else:
             close_ratio = 1.0
@@ -248,17 +283,48 @@ class StockScreener:
         
         atr_val = float(last_row['ATR14']) if pd.notna(last_row['ATR14']) and float(last_row['ATR14']) > 0 else (close * 0.025)
 
-        # 5. Filter Tren Dasar: Close > MA20 ATAU Close > MA50
-        if not (close > ma20 or close > ma50):
-            logger.debug(f"[REJECT] {ticker}: Close di bawah MA20 & MA50")
+        # 5. Hard Filter Tren (SPEC): Close > MA20 DAN MA20 > MA50 — struktur uptrend wajib,
+        # bukan alternatif. Saham di luar struktur ini tidak diloloskan berapa pun skornya.
+        if not (close > ma20 and ma20 > ma50):
+            logger.debug(f"[REJECT] {ticker}: Struktur tren bukan uptrend sehat (Close {close:,.0f}, MA20 {ma20:,.0f}, MA50 {ma50:,.0f})")
             return None
 
-        # 6. Filter RSI: 38 <= RSI <= 62
-        if not (38.0 <= rsi <= 62.0):
-            logger.debug(f"[REJECT] {ticker}: RSI {rsi:.2f} di luar rentang 38 - 62")
+        # 6. Hard Filter RSI (SPEC): 42 <= RSI <= 56 (buy on weakness, bukan overbought)
+        if not (42.0 <= rsi <= 56.0):
+            logger.debug(f"[REJECT] {ticker}: RSI {rsi:.2f} di luar rentang 42 - 56")
             return None
 
-        # --- ATR-BASED DYNAMIC SL & TP ---
+        # 7. Hard Filter Konfirmasi Volume (SPEC): SMA Volume 5 > SMA Volume 20 (akumulasi)
+        if not (vol_ma5 > vol_ma20):
+            logger.debug(f"[REJECT] {ticker}: Vol MA5 ({vol_ma5:,.0f}) <= Vol MA20 ({vol_ma20:,.0f}) - tidak ada akumulasi")
+            return None
+
+        # 8. Sanity Check Resistance (SPEC): ruang naik ke resistance/recent high
+        # terdekat (high tertinggi 50 bar SEBELUM hari ini) minimal 3%.
+        # Jika close sudah menembus high tersebut (breakout), tidak ada plafon -> lolos.
+        resistance = None
+        resistance_room_pct = None
+        if len(df) >= 11 and 'High' in df.columns:
+            prev_highs = df['High'].iloc[-51:-1]
+            if not prev_highs.empty:
+                resistance = float(prev_highs.max())
+                if resistance > close:
+                    resistance_room_pct = ((resistance - close) / close) * 100.0
+                    if resistance_room_pct < 3.0:
+                        logger.debug(f"[REJECT] {ticker}: Ruang ke resistance Rp {resistance:,.0f} hanya {resistance_room_pct:.1f}% (< 3%)")
+                        return None
+                else:
+                    resistance_room_pct = 100.0  # breakout di atas recent high
+
+        # 9. Sanity Check Fundamental Dasar (SPEC): PER positif & DER < 2 bila data tersedia.
+        fundamental = check_fundamental_safety(ticker)
+        if not fundamental.get("ok"):
+            logger.debug(f"[REJECT] {ticker}: {fundamental.get('status')}")
+            return None
+
+        # --- ATR-BASED DYNAMIC SL & TP (SPEC) ---
+        # SL: Close - (1.2 x ATR), di-clamp ke rentang -2.0% s/d -4.5%.
+        # TP: Close + (2.4 x ATR) — berbasis ATR, BUKAN diturunkan dari % SL.
         raw_sl_distance = 1.2 * atr_val
         raw_sl_pct = -(raw_sl_distance / close)
 
@@ -269,10 +335,8 @@ class StockScreener:
         else:
             sl_pct = raw_sl_pct
 
-        tp_pct = abs(sl_pct) * 2.0
-
         raw_sl_price = close * (1.0 + sl_pct)
-        raw_tp_price = close * (1.0 + tp_pct)
+        raw_tp_price = close + (2.4 * atr_val)
 
         stop_loss = round_to_idx_tick(raw_sl_price)
         take_profit = round_to_idx_tick(raw_tp_price)
@@ -281,17 +345,12 @@ class StockScreener:
         tp_percent_real = ((take_profit - close) / close) * 100.0
 
         # --- SKORING & RANKING QUALITY ---
-        if close > ma20 and ma20 > ma50:
-            trend_score = 30.0
-        elif close > ma20:
-            trend_score = 20.0
-        else:
-            trend_score = 10.0
+        # Tren kini syarat keras untuk semua kandidat lolos, jadi skor tren konstan;
+        # ranking ditentukan kombinasi RSI terdekat 48, turnover, volume, dan candle (SPEC).
+        trend_score = 30.0
 
         rsi_diff = abs(rsi - 48.0)
-        rsi_score = max(0.0, 35.0 - (rsi_diff * 3.5))
-        if 42.0 <= rsi <= 56.0:
-            rsi_score += 5.0
+        rsi_score = max(0.0, 35.0 - (rsi_diff * 3.5)) + 5.0
 
         if turnover >= 20_000_000_000:
             turnover_score = 25.0
@@ -331,6 +390,9 @@ class StockScreener:
             "sl_percent": sl_percent_real,
             "take_profit": take_profit,
             "tp_percent": tp_percent_real,
+            "resistance": resistance,
+            "resistance_room_pct": resistance_room_pct,
+            "fundamental_status": fundamental.get("status"),
             "date": date_str
         }
 
