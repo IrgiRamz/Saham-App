@@ -59,7 +59,7 @@ MVP **Saham App** bertujuan untuk mendeteksi sinyal *Swing Trading Pullback* pad
 POST /api/v1/scan HTTP/1.1
 Host: localhost:8000
 Content-Type: application/json
-X-Cron-Key: supersecretcronkey123
+X-Cron-Key: <SECRET_CRON_KEY dari .env — jangan tulis nilai aslinya di dokumen>
 ```
 
 #### Response Success (`202 Accepted`):
