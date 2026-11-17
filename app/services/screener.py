@@ -1,15 +1,47 @@
 import os
 import json
+import time
 import logging
-from typing import List, Dict, Any
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional
 import httpx
-import yfinance as yf
-import pandas as pd
-import pandas_ta as ta
 
 from app.config import settings
 
 logger = logging.getLogger("saham_app.screener")
+
+# ---------------------------------------------------------------------------
+# SUMBER DATA: TradingView Scanner API (indonesia/scan).
+#
+# Riwayat: versi sebelumnya memakai Yahoo Finance via yfinance. Sejak deploy
+# pertama (2026-10-21) Yahoo me-rate-limit IP VPS secara total (HTTP 429
+# untuk yfinance maupun chart API mentah), sehingga check_market_regime()
+# TIDAK PERNAH berhasil membaca IHSG di server dan sistem selalu fail-closed.
+# TradingView scanner terverifikasi dapat diakses dari VPS dan nilainya cocok
+# dengan hitungan Yahoo (^JKSE vs IDX:COMPOSITE identik).
+#
+# Adaptasi kolom (semantik SPEC dipertahankan, jendela disesuaikan dengan
+# kolom yang disediakan TradingView):
+# - Turnover: kolom "Value.Traded" (nilai transaksi riil), fallback close*volume.
+# - Konfirmasi volume: rata-rata volume 10 hari > 30 hari (pengganti SMA Vol
+#   5 > 20; TradingView tidak menyediakan SMA volume 5/20).
+# - Resistance: high 52 minggu (pengganti recent high 50 hari; TradingView
+#   tidak menyediakan high 50 hari).
+# - Fundamental: PER = "price_earnings_ttm", DER = "debt_to_equity"
+#   (TradingView; utang dalam definisi sempit, jadi cek ini best-effort).
+# ---------------------------------------------------------------------------
+
+TV_SCAN_URL = "https://scanner.tradingview.com/indonesia/scan"
+TV_MARKET_SYMBOL = "IDX:COMPOSITE"
+TV_MARKET_COLUMNS = ["close", "SMA20", "SMA50", "change"]
+TV_SCAN_COLUMNS = [
+    "close", "open", "high", "low", "volume", "Value.Traded",
+    "SMA20", "SMA50", "RSI", "ATR",
+    "average_volume_10d_calc", "average_volume_30d_calc",
+    "price_52_week_high", "price_earnings_ttm", "debt_to_equity",
+]
+
+JAKARTA_TZ = timezone(timedelta(hours=7))
 
 DEFAULT_LQ45_TICKERS = [
     "ACES.JK", "ADRO.JK", "AKRA.JK", "AMRT.JK", "ANTM.JK", "ARTO.JK", "ASII.JK",
@@ -28,6 +60,7 @@ DEFAULT_LQ45_TICKERS = [
 LOCAL_TICKERS_FILE = "data/idx_tickers.json"
 PRIMARY_STOCKS_JSON_URL = "https://raw.githubusercontent.com/goapi-id/stocks-indonesia/main/stocks.json"
 
+
 def round_to_idx_tick(price: float) -> int:
     """Membulatkan harga ke fraksi harga resmi BEI (IDX Tick Size)."""
     if price < 200.0:
@@ -42,56 +75,69 @@ def round_to_idx_tick(price: float) -> int:
         tick = 25
     return int(round(price / tick) * tick)
 
-def calculate_rsi_fallback(series: pd.Series, period: int = 14) -> pd.Series:
-    """Manual RSI calculation if pandas_ta fails."""
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
 
-def calculate_atr_fallback(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Manual ATR calculation if pandas_ta fails."""
-    high_low = df['High'] - df['Low']
-    high_cp = (df['High'] - df['Close'].shift(1)).abs()
-    low_cp = (df['Low'] - df['Close'].shift(1)).abs()
-    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
+def to_tv_symbol(ticker: str) -> str:
+    """'BBCA.JK' -> 'IDX:BBCA'."""
+    code = ticker.upper().strip()
+    if code.endswith(".JK"):
+        code = code[:-3]
+    return f"IDX:{code}"
 
-def check_fundamental_safety(ticker: str) -> Dict[str, Any]:
+
+def tv_scan(tv_symbols: List[str], columns: List[str], retries: int = 3) -> Dict[str, Dict[str, Any]]:
     """
-    Filter keamanan fundamental dasar (SPEC bagian 5): emiten harus
-    mencatatkan laba (PER/trailingPE positif) dan DER < 2.
-    Yahoo 'debtToEquity' dilaporkan dalam persen (mis. 45.0 = DER 0.45).
-
-    Hanya dipanggil untuk kandidat yang SUDAH lolos semua filter teknikal,
-    jadi jumlah panggilan network kecil. Bila data tidak tersedia dari
-    Yahoo, kandidat TIDAK ditolak, tetapi ditandai 'tidak terverifikasi'
-    agar statusnya jujur terlihat di notifikasi WA.
+    Satu panggilan batch ke TradingView scanner.
+    Mengembalikan {symbol: {kolom: nilai}}. Melempar exception bila semua
+    percobaan gagal, agar pemanggil dapat fail-closed / mencatat error.
     """
-    try:
-        info = yf.Ticker(ticker).info or {}
-        pe = info.get("trailingPE")
-        de_pct = info.get("debtToEquity")
-        der = (float(de_pct) / 100.0) if de_pct is not None else None
+    payload = {"symbols": {"tickers": tv_symbols}, "columns": columns}
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            with httpx.Client(timeout=30.0, trust_env=False) as client:
+                resp = client.post(
+                    TV_SCAN_URL,
+                    json=payload,
+                    headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            result: Dict[str, Dict[str, Any]] = {}
+            for item in data.get("data", []):
+                values = item.get("d") or []
+                result[item.get("s")] = {columns[i]: values[i] if i < len(values) else None for i in range(len(columns))}
+            return result
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(f"TradingView scan gagal (percobaan {attempt}/{retries}): {exc}")
+            if attempt < retries:
+                time.sleep(2 * attempt)
+    raise RuntimeError(f"TradingView scan gagal setelah {retries} percobaan: {last_exc}")
 
-        if pe is not None and float(pe) <= 0:
-            return {"ok": False, "status": f"DITOLAK fundamental: PER {float(pe):.1f} (tidak laba)"}
-        if der is not None and der >= 2.0:
-            return {"ok": False, "status": f"DITOLAK fundamental: DER {der:.2f} >= 2"}
 
-        if pe is not None or der is not None:
-            pe_txt = f"PER {float(pe):.1f}" if pe is not None else "PER n/a"
-            der_txt = f"DER {der:.2f}" if der is not None else "DER n/a"
-            return {"ok": True, "status": f"Lolos ({pe_txt}, {der_txt})"}
-        return {"ok": True, "status": "tidak terverifikasi (data Yahoo kosong)"}
-    except Exception as exc:
-        logger.warning(f"Cek fundamental {ticker} gagal: {exc}")
-        return {"ok": True, "status": "tidak terverifikasi (gagal ambil data)"}
+def check_fundamental_from_row(pe: Optional[float], der: Optional[float]) -> Dict[str, Any]:
+    """
+    Filter keamanan fundamental dasar (SPEC bagian 5) dari kolom TradingView:
+    emiten harus mencatatkan laba (PER positif) dan DER < 2.
+    Bila data tidak tersedia, kandidat TIDAK ditolak, tetapi ditandai
+    'tidak terverifikasi' agar statusnya jujur terlihat di notifikasi WA.
+    """
+    if pe is not None and float(pe) <= 0:
+        return {"ok": False, "status": f"DITOLAK fundamental: PER {float(pe):.1f} (tidak laba)"}
+    if der is not None and float(der) >= 2.0:
+        return {"ok": False, "status": f"DITOLAK fundamental: DER {float(der):.2f} >= 2"}
+
+    if pe is not None or der is not None:
+        pe_txt = f"PER {float(pe):.1f}" if pe is not None else "PER n/a"
+        der_txt = f"DER {float(der):.2f}" if der is not None else "DER n/a"
+        return {"ok": True, "status": f"Lolos ({pe_txt}, {der_txt})"}
+    return {"ok": True, "status": "tidak terverifikasi (data TradingView kosong)"}
+
 
 def check_market_regime() -> Dict[str, Any]:
     """
-    Memeriksa kesehatan indeks IHSG (^JKSE) sebelum screening saham individu.
+    Memeriksa kesehatan indeks IHSG (IDX:COMPOSITE di TradingView) sebelum
+    screening saham individu.
     Kondisi Pasar Berisiko / Bearish (sesuai SPEC):
     1. IHSG Close < MA20 DAN Close < MA50 (Terkonfirmasi Downtrend).
     2. Perubahan harga IHSG hari ini < -1.5% (Anjlok tajam).
@@ -100,26 +146,23 @@ def check_market_regime() -> Dict[str, Any]:
     mengembalikan is_bearish=True. Circuit breaker yang gagal cek harus
     DIAM (silent mode), bukan meloloskan screening dengan asumsi netral.
     """
-    logger.info("Memeriksa Market Regime IHSG (^JKSE)...")
+    logger.info("Memeriksa Market Regime IHSG (IDX:COMPOSITE via TradingView)...")
     try:
-        ticker = yf.Ticker("^JKSE")
-        df = ticker.history(period="3mo")
-        if df.empty or len(df) < 50:
-            logger.warning("Data IHSG (^JKSE) tidak mencukupi (<50 baris). FAIL-CLOSED: silent mode aktif.")
-            return {"is_bearish": True, "reason": "Data IHSG tidak mencukupi - tidak dapat diverifikasi (fail-closed)"}
+        rows = tv_scan([TV_MARKET_SYMBOL], TV_MARKET_COLUMNS)
+        row = rows.get(TV_MARKET_SYMBOL) or {}
+        ihsg_close = row.get("close")
+        ihsg_ma20 = row.get("SMA20")
+        ihsg_ma50 = row.get("SMA50")
+        change_percent = row.get("change")
 
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['MA50'] = df['Close'].rolling(window=50).mean()
+        if ihsg_close is None or ihsg_ma20 is None or ihsg_ma50 is None or change_percent is None:
+            logger.warning("Data IHSG (TradingView) tidak lengkap. FAIL-CLOSED: silent mode aktif.")
+            return {"is_bearish": True, "reason": "Data IHSG tidak lengkap - tidak dapat diverifikasi (fail-closed)"}
 
-        last_row = df.iloc[-1]
-        prev_row = df.iloc[-2]
-
-        ihsg_close = float(last_row['Close'])
-        prev_close = float(prev_row['Close'])
-        ihsg_ma20 = float(last_row['MA20'])
-        ihsg_ma50 = float(last_row['MA50'])
-
-        change_percent = ((ihsg_close - prev_close) / prev_close) * 100.0
+        ihsg_close = float(ihsg_close)
+        ihsg_ma20 = float(ihsg_ma20)
+        ihsg_ma50 = float(ihsg_ma50)
+        change_percent = float(change_percent)
 
         is_downtrend = (ihsg_close < ihsg_ma20) and (ihsg_close < ihsg_ma50)
         is_sharp_drop = change_percent < -1.5
@@ -134,7 +177,7 @@ def check_market_regime() -> Dict[str, Any]:
         elif is_sharp_drop:
             reason = f"IHSG Anjlok Tajam Hari Ini ({change_percent:.2f}%)"
 
-        date_str = str(last_row.name.strftime("%Y-%m-%d")) if hasattr(last_row.name, "strftime") else str(last_row.name)
+        date_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d")
 
         if is_bearish:
             logger.info(
@@ -157,8 +200,9 @@ def check_market_regime() -> Dict[str, Any]:
             "date": date_str
         }
     except Exception as exc:
-        logger.warning(f"Gagal mengambil data IHSG (^JKSE): {exc}. FAIL-CLOSED: silent mode aktif.")
+        logger.warning(f"Gagal mengambil data IHSG (TradingView): {exc}. FAIL-CLOSED: silent mode aktif.")
         return {"is_bearish": True, "reason": f"Data IHSG gagal diambil ({exc}) - tidak dapat diverifikasi (fail-closed)"}
+
 
 def get_all_idx_tickers() -> List[str]:
     """Mengambil daftar emiten BEI dari file lokal 'data/idx_tickers.json' atau URL remote."""
@@ -178,7 +222,7 @@ def get_all_idx_tickers() -> List[str]:
         if response.status_code == 200:
             data = response.json()
             raw_items = data if isinstance(data, list) else data.get("data", [])
-            
+
             tickers = []
             for item in raw_items:
                 code = item if isinstance(item, str) else (item.get("symbol") or item.get("ticker") or item.get("code"))
@@ -198,30 +242,43 @@ def get_all_idx_tickers() -> List[str]:
     logger.info(f"Menggunakan fallback {len(DEFAULT_LQ45_TICKERS)} ticker utama BEI.")
     return DEFAULT_LQ45_TICKERS
 
+
 class StockScreener:
     def __init__(
         self,
         min_turnover: float = None,
         max_limit: int = 3,
-        chunk_size: int = 50
+        chunk_size: int = 150
     ):
         self.min_turnover = min_turnover if min_turnover is not None else settings.MIN_DAILY_TURNOVER
         self.max_limit = max_limit if max_limit is not None else settings.MAX_SIGNAL_NOTIFICATIONS
         self.chunk_size = chunk_size
 
-    def analyze_single_df(self, ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
-        """Menganalisis 1 emiten saham dengan ATR-based Dynamic SL & TP (Risk-to-Reward 1:2)."""
-        if df.empty or len(df) < 50:
-            logger.debug(f"[REJECT] {ticker}: Data tidak mencukupi (<50 baris)")
+    def analyze_single_row(self, ticker: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Menganalisis 1 emiten dari baris data TradingView dengan ATR-based Dynamic SL & TP (Risk-to-Reward 1:2)."""
+        close = row.get("close")
+        open_ = row.get("open")
+        high = row.get("high")
+        low = row.get("low")
+        volume = row.get("volume")
+        ma20 = row.get("SMA20")
+        ma50 = row.get("SMA50")
+        rsi = row.get("RSI")
+        atr_val = row.get("ATR")
+        vol_avg10 = row.get("average_volume_10d_calc")
+        vol_avg30 = row.get("average_volume_30d_calc")
+
+        if close is None or volume is None or high is None or low is None:
+            logger.debug(f"[REJECT] {ticker}: Data inti tidak lengkap dari TradingView")
             return None
 
-        last_row = df.iloc[-1]
-        
-        close = float(last_row['Close'])
-        volume = float(last_row['Volume'])
-        high = float(last_row['High'])
-        low = float(last_row['Low'])
-        turnover = close * volume
+        close = float(close)
+        volume = float(volume)
+        high = float(high)
+        low = float(low)
+
+        value_traded = row.get("Value.Traded")
+        turnover = float(value_traded) if value_traded is not None else close * volume
 
         # 1. Hard Filter: Harga Minimal Rp 100
         if close < 100.0:
@@ -250,38 +307,13 @@ class StockScreener:
         else:
             close_ratio = 1.0
 
-        # Technical Indicators
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['MA50'] = df['Close'].rolling(window=50).mean()
-        df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
-        df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
-
-        try:
-            rsi_res = df.ta.rsi(length=14)
-            if rsi_res is not None and not rsi_res.dropna().empty:
-                df['RSI14'] = rsi_res
-            else:
-                df['RSI14'] = calculate_rsi_fallback(df['Close'], 14)
-        except Exception:
-            df['RSI14'] = calculate_rsi_fallback(df['Close'], 14)
-
-        try:
-            atr_res = df.ta.atr(length=14)
-            if atr_res is not None and not atr_res.dropna().empty:
-                df['ATR14'] = atr_res
-            else:
-                df['ATR14'] = calculate_atr_fallback(df, 14)
-        except Exception:
-            df['ATR14'] = calculate_atr_fallback(df, 14)
-
-        last_row = df.iloc[-1]
-        ma20 = float(last_row['MA20'])
-        ma50 = float(last_row['MA50'])
-        rsi = float(last_row['RSI14'])
-        vol_ma5 = float(last_row['Vol_MA5'])
-        vol_ma20 = float(last_row['Vol_MA20'])
-        
-        atr_val = float(last_row['ATR14']) if pd.notna(last_row['ATR14']) and float(last_row['ATR14']) > 0 else (close * 0.025)
+        if ma20 is None or ma50 is None or rsi is None:
+            logger.debug(f"[REJECT] {ticker}: Indikator (MA/RSI) tidak tersedia dari TradingView")
+            return None
+        ma20 = float(ma20)
+        ma50 = float(ma50)
+        rsi = float(rsi)
+        atr_val = float(atr_val) if atr_val is not None and float(atr_val) > 0 else (close * 0.025)
 
         # 5. Hard Filter Tren (SPEC): Close > MA20 DAN MA20 > MA50 — struktur uptrend wajib,
         # bukan alternatif. Saham di luar struktur ini tidak diloloskan berapa pun skornya.
@@ -294,30 +326,33 @@ class StockScreener:
             logger.debug(f"[REJECT] {ticker}: RSI {rsi:.2f} di luar rentang 42 - 56")
             return None
 
-        # 7. Hard Filter Konfirmasi Volume (SPEC): SMA Volume 5 > SMA Volume 20 (akumulasi)
-        if not (vol_ma5 > vol_ma20):
-            logger.debug(f"[REJECT] {ticker}: Vol MA5 ({vol_ma5:,.0f}) <= Vol MA20 ({vol_ma20:,.0f}) - tidak ada akumulasi")
+        # 7. Hard Filter Konfirmasi Volume: rata-rata volume 10 hari > 30 hari (akumulasi).
+        # Adaptasi TradingView untuk SMA Vol 5 > 20 pada SPEC (kolom 5/20 tidak tersedia).
+        if vol_avg10 is None or vol_avg30 is None or not (float(vol_avg10) > float(vol_avg30)):
+            logger.debug(f"[REJECT] {ticker}: Vol rata-rata 10 hari ({vol_avg10}) <= 30 hari ({vol_avg30}) - tidak ada akumulasi")
             return None
+        vol_avg10 = float(vol_avg10)
+        vol_avg30 = float(vol_avg30)
 
-        # 8. Sanity Check Resistance (SPEC): ruang naik ke resistance/recent high
-        # terdekat (high tertinggi 50 bar SEBELUM hari ini) minimal 3%.
-        # Jika close sudah menembus high tersebut (breakout), tidak ada plafon -> lolos.
+        # 8. Sanity Check Resistance (SPEC): ruang naik ke resistance terdekat
+        # minimal 3%. Resistance di sini = high 52 minggu (adaptasi TradingView
+        # untuk recent high 50 hari). Jika close menembus high tersebut
+        # (breakout), tidak ada plafon -> lolos.
         resistance = None
         resistance_room_pct = None
-        if len(df) >= 11 and 'High' in df.columns:
-            prev_highs = df['High'].iloc[-51:-1]
-            if not prev_highs.empty:
-                resistance = float(prev_highs.max())
-                if resistance > close:
-                    resistance_room_pct = ((resistance - close) / close) * 100.0
-                    if resistance_room_pct < 3.0:
-                        logger.debug(f"[REJECT] {ticker}: Ruang ke resistance Rp {resistance:,.0f} hanya {resistance_room_pct:.1f}% (< 3%)")
-                        return None
-                else:
-                    resistance_room_pct = 100.0  # breakout di atas recent high
+        high_52w = row.get("price_52_week_high")
+        if high_52w is not None:
+            resistance = float(high_52w)
+            if resistance > close:
+                resistance_room_pct = ((resistance - close) / close) * 100.0
+                if resistance_room_pct < 3.0:
+                    logger.debug(f"[REJECT] {ticker}: Ruang ke resistance Rp {resistance:,.0f} hanya {resistance_room_pct:.1f}% (< 3%)")
+                    return None
+            else:
+                resistance_room_pct = 100.0  # breakout di atas high 52 minggu
 
         # 9. Sanity Check Fundamental Dasar (SPEC): PER positif & DER < 2 bila data tersedia.
-        fundamental = check_fundamental_safety(ticker)
+        fundamental = check_fundamental_from_row(row.get("price_earnings_ttm"), row.get("debt_to_equity"))
         if not fundamental.get("ok"):
             logger.debug(f"[REJECT] {ticker}: {fundamental.get('status')}")
             return None
@@ -363,11 +398,11 @@ class StockScreener:
         else:
             turnover_score = 5.0
 
-        vol_bonus = 5.0 if vol_ma5 > vol_ma20 else 0.0
+        vol_bonus = 5.0 if vol_avg10 > vol_avg30 else 0.0
         candle_bonus = 5.0 if close_ratio >= 0.65 else 0.0
 
         total_score = round(trend_score + rsi_score + turnover_score + vol_bonus + candle_bonus, 2)
-        date_str = str(last_row.name.strftime("%Y-%m-%d")) if hasattr(last_row.name, "strftime") else str(last_row.name)
+        date_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d")
 
         logger.info(
             f"[QUALIFIED - SCORE {total_score}] {ticker}: Close Rp {close:,.0f} | ATR: {atr_val:,.0f} | "
@@ -382,8 +417,8 @@ class StockScreener:
             "rsi14": rsi,
             "atr": atr_val,
             "volume": volume,
-            "vol_ma5": vol_ma5,
-            "vol_ma20": vol_ma20,
+            "vol_ma5": vol_avg10,
+            "vol_ma20": vol_avg30,
             "turnover": turnover,
             "score": total_score,
             "stop_loss": stop_loss,
@@ -398,10 +433,10 @@ class StockScreener:
 
     def run_screening(self, tickers: List[str] = None) -> List[Dict[str, Any]]:
         """
-        Menjalankan screening dengan Silent Mode pada Market Regime Filter IHSG (^JKSE).
+        Menjalankan screening dengan Silent Mode pada Market Regime Filter IHSG.
         Jika IHSG Bearish/Berisiko, langsung early return dan aktifkan silent mode (tanpa pengiriman notifikasi WA).
         """
-        # 1. Market Regime Filter (Check IHSG ^JKSE)
+        # 1. Market Regime Filter (Check IHSG via TradingView)
         market_regime = check_market_regime()
         if market_regime.get("is_bearish"):
             logger.info(
@@ -423,57 +458,43 @@ class StockScreener:
             f"Memulai screening {len(all_tickers)} saham BEI "
             f"(Target Top {self.max_limit} emiten terbaik)..."
         )
-        
+
         matched_signals = []
         chunks = [all_tickers[i:i + self.chunk_size] for i in range(0, len(all_tickers), self.chunk_size)]
+        failed_chunks = 0
 
         for index, chunk in enumerate(chunks, 1):
             logger.info(f"Processing chunk {index}/{len(chunks)} ({len(chunk)} tickers)...")
             try:
-                data = yf.download(
-                    tickers=chunk,
-                    period="6mo",
-                    progress=False,
-                    threads=True,
-                    group_by="ticker"
-                )
-
-                if data.empty:
-                    continue
-
-                for ticker in chunk:
-                    try:
-                        if isinstance(data.columns, pd.MultiIndex):
-                            if ticker in data.columns.levels[0]:
-                                ticker_df = data[ticker].dropna(subset=['Close'])
-                            elif 'Close' in data.columns.levels[0] and ticker in data['Close'].columns:
-                                ticker_df = pd.DataFrame({
-                                    'Close': data['Close'][ticker],
-                                    'High': data['High'][ticker],
-                                    'Low': data['Low'][ticker],
-                                    'Volume': data['Volume'][ticker]
-                                }).dropna(subset=['Close'])
-                            else:
-                                continue
-                        else:
-                            ticker_df = data.dropna(subset=['Close'])
-
-                        signal = self.analyze_single_df(ticker, ticker_df)
-                        if signal:
-                            matched_signals.append(signal)
-                    except Exception as exc:
-                        logger.debug(f"Error memproses {ticker}: {exc}")
-
+                tv_symbols = [to_tv_symbol(t) for t in chunk]
+                rows = tv_scan(tv_symbols, TV_SCAN_COLUMNS)
             except Exception as exc:
+                failed_chunks += 1
                 logger.error(f"Error pada chunk {index}: {exc}")
+                continue
+
+            for ticker in chunk:
+                row = rows.get(to_tv_symbol(ticker))
+                if row is None:
+                    continue
+                try:
+                    signal = self.analyze_single_row(ticker, row)
+                    if signal:
+                        matched_signals.append(signal)
+                except Exception as exc:
+                    logger.debug(f"Error memproses {ticker}: {exc}")
+
+        if failed_chunks == len(chunks) and len(chunks) > 0:
+            logger.error("SEMUA chunk gagal diambil dari TradingView. Screening tidak menghasilkan data yang dapat dipercaya.")
 
         matched_signals.sort(key=lambda x: (x["score"], x["turnover"]), reverse=True)
         final_signals = matched_signals[:self.max_limit]
-        
+
         logger.info(
             f"Screening selesai. Lolos kualifikasi: {len(matched_signals)} emiten. "
             f"Diambil Top {len(final_signals)} emiten terbaik."
         )
         return final_signals
+
 
 screener_service = StockScreener()
