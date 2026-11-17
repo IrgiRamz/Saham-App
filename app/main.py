@@ -66,7 +66,7 @@ async def process_stock_scan_background():
             rrr = (sig['tp_percent'] / abs(sig['sl_percent'])) if sig.get('sl_percent') else 0.0
             resistance_line = ""
             if sig.get('resistance'):
-                resistance_line = f"- Resistance Terdekat: Rp {sig['resistance']:,.0f} (ruang naik {sig.get('resistance_room_pct', 0):.1f}%)\n"
+                resistance_line = f"- Resistance (High 52 Minggu): Rp {sig['resistance']:,.0f} (ruang naik {sig.get('resistance_room_pct', 0):.1f}%)\n"
             fundamental_line = f"- Fundamental: {sig.get('fundamental_status', 'tidak terverifikasi')}\n"
             msg = (
                 f"🚨 *SINYAL SWING TRADING BEI (TOP 3)* 🚨\n\n"
@@ -78,7 +78,7 @@ async def process_stock_scan_background():
                 f"📊 *Indikator Technical:*\n"
                 f"- Trend: Close (Rp {sig['close']:,.0f}) > MA20 (Rp {sig['ma20']:,.0f}) > MA50 (Rp {sig['ma50']:,.0f})\n"
                 f"- RSI(14): {sig['rsi14']:.2f} (Syarat Lolos: 42-56)\n"
-                f"- Volume Trend: Vol MA5 ({sig['vol_ma5']/100:,.0f} lot) > Vol MA20 ({sig['vol_ma20']/100:,.0f} lot)\n"
+                f"- Volume Trend: Rata-rata Vol 10 hari ({sig['vol_ma5']/100:,.0f} lot) > Rata-rata Vol 30 hari ({sig['vol_ma20']/100:,.0f} lot)\n"
                 f"{resistance_line}"
                 f"{fundamental_line}\n"
                 f"🎯 *Plan Trading:*\n"
