@@ -8,7 +8,8 @@ Perbedaan mendasar dengan Swing:
   Tidak memakai regime filter swing; gerbangnya likuiditas + momentum intraday.
 
 Strategi: momentum long-only.
-- Harga >= Rp100, turnover intraday (Value.Traded) >= Rp10 miliar
+- Harga Rp100 s/d Rp9.000 (batas atas dari Irgi: di atas itu 1 lot terlalu
+  mahal untuk modal scalp-nya), turnover intraday (Value.Traded) >= Rp10 miliar
   (likuiditas adalah syarat mutlak untuk bisa keluar-masuk cepat).
 - Change hari berjalan +1.5% s/d +7% (bergerak, tapi belum habis/ARA).
 - Harga di atas VWAP intraday (pembeli memegang kendali hari ini).
@@ -41,6 +42,7 @@ TV_SCALP_COLUMNS = [
 ]
 
 MIN_PRICE = 100
+MAX_PRICE = 9000  # permintaan Irgi 2026-11-25: UNTR Rp23rb+ per lembar terlalu mahal
 MIN_TURNOVER_INTRADAY = 10_000_000_000  # Rp10 miliar
 MIN_CHANGE_PCT = 1.5
 MAX_CHANGE_PCT = 7.0
@@ -167,7 +169,7 @@ def _analyze(ticker: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if turnover is None:
         turnover = close * volume
 
-    if close < MIN_PRICE:
+    if close < MIN_PRICE or close > MAX_PRICE:
         return None
     if turnover < MIN_TURNOVER_INTRADAY:
         return None
