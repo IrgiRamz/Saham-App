@@ -23,6 +23,10 @@ Plan per sinyal (harga dibulatkan ke fraksi BEI):
 Anti-spam (state harian di data/scalp_state.json):
 - Maks 3 sinyal per hari; ticker yang sama maks 1x per hari.
 - Di luar jendela sesi BEI, run_scalp_scan() menolak bekerja (return []).
+
+Rem IHSG intraday (disetujui Irgi 2026-11-25):
+- Bila change IHSG hari berjalan <= -1.0%, sinyal long baru DITAHAN
+  (return []) karena saham yang naik sendirian mudah terseret pasar panik.
 """
 import os
 import json
@@ -51,6 +55,7 @@ SL_PCT = -1.2
 TP1_PCT = 1.8
 TP2_PCT = 3.0
 MAX_SIGNALS_PER_DAY = 3
+IHSG_BRAKE_PCT = -1.0  # rem: change IHSG intraday <= angka ini, sinyal ditahan
 BATCH_SIZE = 150
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -107,6 +112,17 @@ def run_scalp_scan() -> List[Dict[str, Any]]:
     now = datetime.now(WIB)
     if not in_scalp_window(now):
         logger.info(f"[SCALP] Di luar jendela sesi BEI ({now:%H:%M} WIB). Tidak scan.")
+        return []
+
+    # Rem IHSG intraday: pasar jatuh <= -1% -> tahan semua sinyal long baru.
+    market = tv_scan(["IDX:COMPOSITE"], ["change"])
+    mrow = market.get("IDX:COMPOSITE") if market else None
+    if mrow is None:
+        logger.error("[SCALP] Data IHSG tidak bisa diambil dari TradingView. Scan dibatalkan (fail-closed).")
+        return []
+    ihsg_change = _num(mrow, "change")
+    if ihsg_change is not None and ihsg_change <= IHSG_BRAKE_PCT:
+        logger.info(f"[SCALP] Rem IHSG aktif: IHSG {ihsg_change:+.2f}% <= {IHSG_BRAKE_PCT}%. Sinyal ditahan.")
         return []
 
     today = now.strftime("%Y-%m-%d")
