@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.services.screener import screener_service
-from app.services.scalper import run_scalp_scan
+from app.services.scalper import run_scalp_scan, build_scalp_reminder
 from app.services.notifier import notifier_service
 
 # Logging Setup
@@ -132,6 +132,19 @@ async def process_scalp_scan_background():
     except Exception as exc:
         logger.error(f"Error pada process_scalp_scan_background: {exc}")
 
+async def process_scalp_reminder_background():
+    """Pengingat tutup posisi scalp 15:15 WIB. Diam bila hari ini tidak ada
+    sinyal scalp terkirim atau pengingat sudah terkirim (anti dobel)."""
+    try:
+        msg = build_scalp_reminder()
+        if not msg:
+            logger.info("[SCALP] Pengingat 15:15 dilewati: tidak ada sinyal hari ini / sudah terkirim.")
+            return
+        await notifier_service.send_message(message=msg)
+        logger.info("[SCALP] Pengingat tutup posisi terkirim.")
+    except Exception as exc:
+        logger.error(f"Error pada process_scalp_reminder_background: {exc}")
+
 @app.get("/")
 def read_root():
     # Jangan bocorkan nomor target, URL gateway, atau device id ke publik.
@@ -208,6 +221,22 @@ def trigger_scalp_scan(
     return ScanResponse(
         status="success",
         message="Proses pemindaian Scalping dimulai di latar belakang.",
+        timestamp=datetime.now().isoformat()
+    )
+
+@app.post("/api/v1/scalp-reminder", status_code=status.HTTP_202_ACCEPTED, response_model=ScanResponse)
+def trigger_scalp_reminder(
+    background_tasks: BackgroundTasks,
+    x_cron_key: str = Header(None, alias="X-Cron-Key")
+):
+    """Pengingat tutup posisi scalp; dipanggil cron 15:15 WIB hari bursa."""
+    verify_cron_key(x_cron_key)
+
+    background_tasks.add_task(process_scalp_reminder_background)
+
+    return ScanResponse(
+        status="success",
+        message="Proses pengingat tutup posisi Scalping dimulai di latar belakang.",
         timestamp=datetime.now().isoformat()
     )
 
