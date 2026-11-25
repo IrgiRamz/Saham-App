@@ -172,6 +172,37 @@ def run_scalp_scan() -> List[Dict[str, Any]]:
     return picked
 
 
+def build_scalp_reminder() -> Optional[str]:
+    """Susun pesan pengingat tutup posisi untuk 15:15 WIB.
+
+    Return None (diam) bila hari ini tidak ada sinyal scalp terkirim, atau
+    pengingat sudah pernah dikirim hari ini. Bila pesan disusun, state
+    ditandai reminder_sent=True agar tidak terkirim dua kali.
+    Sistem tidak tahu Irgi benar-benar membeli atau tidak, jadi pesan
+    selalu menyertakan pengecualian "abaikan bila tidak ambil posisi".
+    """
+    now = datetime.now(WIB)
+    today = now.strftime("%Y-%m-%d")
+    state = _load_state(today)
+    sent: Dict[str, str] = state.get("sent", {})
+    if state.get("date") != today or not sent:
+        return None
+    if state.get("reminder_sent"):
+        return None
+    daftar = "\n".join(f"- {t} (sinyal {jam} WIB)" for t, jam in sorted(sent.items(), key=lambda kv: kv[1]))
+    state["reminder_sent"] = True
+    _save_state(state)
+    return (
+        "⏰ *PENGINGAT TUTUP POSISI SCALPING* ⏰\n\n"
+        "Sinyal scalp yang terkirim hari ini:\n"
+        f"{daftar}\n\n"
+        "Pasar masuk pra-penutupan 15:50. *Tutup SEMUA posisi scalp kamu sekarang "
+        "di harga pasar, berapa pun hasilnya* (untung, rugi, atau impas). "
+        "Jangan diinapkan ke besok, SL tidak melindungi dari gap pagi.\n\n"
+        "Kalau hari ini kamu tidak ambil posisi scalp apa pun, abaikan pesan ini."
+    )
+
+
 def _analyze(ticker: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     close = _num(row, "close")
     high = _num(row, "high")
