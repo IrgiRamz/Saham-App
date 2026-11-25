@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.services.screener import screener_service
+from app.services.scalper import run_scalp_scan
 from app.services.notifier import notifier_service
 
 # Logging Setup
@@ -95,6 +96,42 @@ async def process_stock_scan_background():
     except Exception as exc:
         logger.error(f"Error pada process_stock_scan_background: {exc}")
 
+async def process_scalp_scan_background():
+    """
+    Background task Mode SCALPING (intraday). Terpisah total dari mode Swing:
+    sinyal hanya dikirim pada jendela sesi BEI, maks 3/hari, dan pesan WA-nya
+    berlabel MODE SCALPING dengan peringatan wajib tutup posisi hari yang sama.
+    Tidak ada kandidat / di luar sesi = diam (tanpa WA), sama seperti swing.
+    """
+    logger.info("Background task scalp scan dimulai.")
+    try:
+        signals = run_scalp_scan()
+        if not signals:
+            return
+        logger.info(f"[SCALP] Mengirimkan {len(signals)} notifikasi scalping ke WhatsApp...")
+        for sig in signals:
+            vwap_line = f"- VWAP Intraday: Rp {sig['vwap']:,.0f} (harga di atas VWAP)\n" if sig.get('vwap') else ""
+            msg = (
+                f"⚡ *SINYAL SCALPING BEI (INTRADAY)* ⚡\n"
+                f"_MODE SCALPING, bukan swing. Wajib tutup posisi hari ini sebelum 15:30, JANGAN diinapkan._\n\n"
+                f"📌 *Ticker:* {sig['ticker']}\n"
+                f"⭐ *Skor Momentum:* {sig['score']} / 100\n"
+                f"💵 *Harga Sinyal:* Rp {sig['close']:,.0f} (pukul {sig['time']} WIB)\n"
+                f"📈 *Naik Hari Ini:* +{sig['change_pct']:.1f}% (dari open +{sig['change_from_open_pct']:.1f}%)\n"
+                f"💰 *Turnover Intraday:* Rp {sig['turnover']/1e9:.1f} Miliar\n"
+                f"{vwap_line}\n"
+                f"🎯 *Plan Scalping:*\n"
+                f"- 🛡️ *Stop Loss:* Rp {sig['stop_loss']:,.0f} ({sig['sl_percent']:.1f}%)\n"
+                f"- 🚀 *Target 1:* Rp {sig['tp1']:,.0f} (+{sig['tp1_percent']:.1f}%)\n"
+                f"- 🚀 *Target 2:* Rp {sig['tp2']:,.0f} (+{sig['tp2_percent']:.1f}%)\n\n"
+                f"⚠️ *Aturan mode ini:* SL jangan digeser, kena SL = keluar. Semua posisi scalp ditutup sebelum pasar tutup, untung maupun rugi.\n"
+                f"⏰ *Waktu Sinyal:* {sig['time']} WIB (hari bursa berjalan)"
+            )
+            await notifier_service.send_message(message=msg)
+        logger.info(f"[SCALP] Background task selesai. {len(signals)} notifikasi diproses.")
+    except Exception as exc:
+        logger.error(f"Error pada process_scalp_scan_background: {exc}")
+
 @app.get("/")
 def read_root():
     # Jangan bocorkan nomor target, URL gateway, atau device id ke publik.
@@ -151,6 +188,26 @@ def trigger_stock_scan(
     return ScanResponse(
         status="success",
         message="Proses pemindaian saham Swing Trading dimulai di latar belakang.",
+        timestamp=datetime.now().isoformat()
+    )
+
+@app.post("/api/v1/scalp", status_code=status.HTTP_202_ACCEPTED, response_model=ScanResponse)
+def trigger_scalp_scan(
+    background_tasks: BackgroundTasks,
+    x_cron_key: str = Header(None, alias="X-Cron-Key")
+):
+    """
+    Endpoint Mode SCALPING (intraday). Dipanggil cron tiap 15 menit pada jam
+    bursa; jendela sesi, kuota harian, dan dedupe ticker ditegakkan di dalam
+    run_scalp_scan() sehingga panggilan di luar sesi aman (tidak mengirim WA).
+    """
+    verify_cron_key(x_cron_key)
+
+    background_tasks.add_task(process_scalp_scan_background)
+
+    return ScanResponse(
+        status="success",
+        message="Proses pemindaian Scalping dimulai di latar belakang.",
         timestamp=datetime.now().isoformat()
     )
 
