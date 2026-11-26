@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.config import settings
 from app.services.screener import screener_service
 from app.services.scalper import run_scalp_scan, build_scalp_reminder
+from app.services.accumulator import build_accumulation_report
 from app.services.notifier import notifier_service
 
 # Logging Setup
@@ -132,6 +133,21 @@ async def process_scalp_scan_background():
     except Exception as exc:
         logger.error(f"Error pada process_scalp_scan_background: {exc}")
 
+async def process_accumulation_background(force: bool = False):
+    """Laporan bulanan Mode Akumulasi (Value + Dividen). Dipanggil cron
+    tanggal 28-31 jam 10:00 WIB; gerbang hari kerja terakhir bulan + anti
+    dobel ditegakkan di build_accumulation_report(). Berbeda dengan swing,
+    laporan ini selalu terkirim pada hari jadwal (termasuk 0 kandidat)."""
+    try:
+        msg = build_accumulation_report(force=force)
+        if not msg:
+            logger.info("[AKUMULASI] Bukan hari jadwal / sudah terkirim bulan ini. Diam.")
+            return
+        await notifier_service.send_message(message=msg)
+        logger.info("[AKUMULASI] Laporan bulanan terkirim.")
+    except Exception as exc:
+        logger.error(f"Error pada process_accumulation_background: {exc}")
+
 async def process_scalp_reminder_background():
     """Pengingat tutup posisi scalp 15:15 WIB. Diam bila hari ini tidak ada
     sinyal scalp terkirim atau pengingat sudah terkirim (anti dobel)."""
@@ -221,6 +237,24 @@ def trigger_scalp_scan(
     return ScanResponse(
         status="success",
         message="Proses pemindaian Scalping dimulai di latar belakang.",
+        timestamp=datetime.now().isoformat()
+    )
+
+@app.post("/api/v1/accumulate", status_code=status.HTTP_202_ACCEPTED, response_model=ScanResponse)
+def trigger_accumulation_report(
+    background_tasks: BackgroundTasks,
+    force: bool = False,
+    x_cron_key: str = Header(None, alias="X-Cron-Key")
+):
+    """Laporan bulanan Mode Akumulasi; dipanggil cron tanggal 28-31 jam 10:00 WIB.
+    Parameter force=1 hanya untuk pengujian manual (tetap wajib X-Cron-Key)."""
+    verify_cron_key(x_cron_key)
+
+    background_tasks.add_task(process_accumulation_background, force)
+
+    return ScanResponse(
+        status="success",
+        message="Proses laporan Akumulasi bulanan dimulai di latar belakang.",
         timestamp=datetime.now().isoformat()
     )
 
