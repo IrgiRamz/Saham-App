@@ -255,8 +255,26 @@ def _fetch_dividend_data(ticker: str) -> Optional[Dict[str, Any]]:
     if pm:
         payout = float(pm.group(1))
 
+    # Untuk pantauan posisi: DPS 12 bulan sebelumnya (bulan ke-13 s/d 24) dan
+    # ex-date terakhir, guna mendeteksi dividen dipotong / hilang.
+    prev_cutoff = today - timedelta(days=730)
+    dps_prev_12m = 0.0
+    last_ex = None
+    for t in tranches:
+        try:
+            amt = float(t.get("amount") or 0)
+            ex = datetime.strptime(str(t.get("ex")), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if prev_cutoff <= ex < cutoff:
+            dps_prev_12m += amt
+        if last_ex is None or ex > last_ex:
+            last_ex = ex
+
     return {
         "dps_trailing_12m": dps_12m,
+        "dps_prev_12m": dps_prev_12m,
+        "last_ex_date": last_ex.isoformat() if last_ex else None,
         "paid_years": paid_years,
         "special_note": special,
         "payout_pct": payout,
@@ -332,6 +350,118 @@ def scan_dividend_pocket() -> Dict[str, Any]:
             "verify_failed": attempts > 0 and failures == attempts}
 
 
+# ------------------------------------------------------------- Pantau posisi
+HOLDINGS_PATH = os.path.join(BASE_DIR, "data", "holdings.json")
+FEE_PCT = 0.4  # perkiraan biaya bolak-balik, sama seperti asumsi mode lain
+
+# Ambang keluar (SPEC-AKUMULASI)
+VALUE_EXIT_PBV = 1.5
+VALUE_EXIT_PER = 15.0
+VALUE_BREAK_ROE = 8.0
+VALUE_BREAK_DER = 2.0
+DIV_BREAK_ROE = 5.0
+DIV_CUT_PCT = 50.0        # DPS 12 bln turun lebih dari ini vs 12 bln sebelumnya
+DIV_GONE_DAYS = 430       # tidak ada pembayaran selama ini = dividen hilang
+
+
+def load_holdings() -> List[Dict[str, Any]]:
+    """Daftar posisi akumulasi Irgi dari data/holdings.json.
+    Format: [{"ticker": "DMAS", "pocket": "dividen"|"value", "lots": 10,
+              "entry_price": 165, "buy_date": "2026-11-26"}]
+    File dikelola asisten dari laporan Irgi lewat chat. Tidak ada file = []."""
+    try:
+        with open(HOLDINGS_PATH, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def evaluate_positions() -> List[str]:
+    """Baris-baris bagian POSISI KAMU: status TAHAN/JUAL + untung-rugi per posisi.
+    Kosong bila Irgi belum memegang posisi akumulasi apa pun."""
+    holdings = load_holdings()
+    if not holdings:
+        return []
+    tickers = sorted({str(h.get("ticker", "")).upper() for h in holdings if h.get("ticker")})
+    rows: Dict[str, Dict[str, Any]] = {}
+    try:
+        raw = tv_scan([to_tv_symbol(t + ".JK") for t in tickers],
+                      ["close", "price_book_ratio", "price_earnings_ttm",
+                       "return_on_equity", "debt_to_equity"])
+        for t in tickers:
+            r = raw.get(to_tv_symbol(t + ".JK"))
+            if r:
+                rows[t] = r
+    except Exception as exc:
+        logger.error(f"[AKUMULASI] Gagal mengambil data posisi: {exc}")
+        return ["(Data posisi tidak terjangkau bulan ini; status tidak dapat dinilai.)"]
+
+    today = datetime.now(WIB).date()
+    lines: List[str] = []
+    for h in holdings:
+        ticker = str(h.get("ticker", "")).upper()
+        pocket = str(h.get("pocket", "")).lower()
+        lots = float(h.get("lots") or 0)
+        entry = float(h.get("entry_price") or 0)
+        row = rows.get(ticker)
+        close = _num(row, "close") if row else None
+        if close is None or entry <= 0 or lots <= 0:
+            lines.append(f"• *{ticker}* — data harga tidak tersedia bulan ini.")
+            continue
+        net_rp = lots * 100 * (close - entry) - (FEE_PCT / 100) * lots * 100 * entry
+        net_pct = net_rp / (lots * 100 * entry) * 100
+        arah = "untung" if net_rp >= 0 else "rugi"
+        pnl_txt = f"Jual sekarang: {arah} {net_pct:+.1f}% ({_fmt_rp(abs(net_rp))}, sudah termasuk biaya ±{FEE_PCT}%)"
+
+        status = None
+        if pocket == "value":
+            pbv = _num(row, "price_book_ratio")
+            per = _num(row, "price_earnings_ttm")
+            roe = _num(row, "return_on_equity")
+            der = _num(row, "debt_to_equity")
+            if roe is not None and roe < VALUE_BREAK_ROE:
+                status = f"🔴 *JUAL* — fundamental rusak: ROE anjlok ke {roe:.0f}%."
+            elif der is not None and der > VALUE_BREAK_DER:
+                status = f"🔴 *JUAL* — fundamental rusak: DER membengkak ke {der:.2f}."
+            elif (pbv is not None and pbv >= VALUE_EXIT_PBV) or (per is not None and per >= VALUE_EXIT_PER):
+                status = "🟡 *PERTIMBANGKAN JUAL* — valuasi sudah normal, diskon habis (misi selesai)."
+            else:
+                status = "🟢 *TAHAN* — valuasi masih murah dan fundamental utuh."
+        elif pocket == "dividen":
+            roe = _num(row, "return_on_equity")
+            d = _fetch_dividend_data(ticker)
+            if roe is not None and roe < DIV_BREAK_ROE:
+                status = f"🔴 *JUAL* — fundamental rusak: ROE anjlok ke {roe:.0f}%."
+            elif d is None:
+                status = "⚪ *BELUM DINILAI* — data dividen tidak terjangkau bulan ini."
+            else:
+                last_ex = d.get("last_ex_date")
+                gone = True
+                if last_ex:
+                    try:
+                        gone = (today - datetime.strptime(last_ex, "%Y-%m-%d").date()).days > DIV_GONE_DAYS
+                    except Exception:
+                        gone = False
+                prev = d.get("dps_prev_12m") or 0.0
+                cur = d.get("dps_trailing_12m") or 0.0
+                if gone:
+                    status = "🔴 *JUAL* — tidak ada pembayaran dividen lebih dari 14 bulan."
+                elif prev > 0 and cur < prev * (1 - DIV_CUT_PCT / 100):
+                    status = f"🔴 *JUAL* — dividen dipotong: DPS 12 bln {cur:.0f} vs {prev:.0f} sebelumnya."
+                elif d.get("payout_pct") is not None and d["payout_pct"] > 100:
+                    status = "🟡 *WASPADA* — payout di atas 100%; dividen dibayar melebihi laba."
+                else:
+                    status = "🟢 *TAHAN* — dividen dan fundamental masih sehat."
+        else:
+            status = "⚪ Kantong tidak dikenal; status tidak dinilai."
+        label = "Value" if pocket == "value" else "Dividen" if pocket == "dividen" else pocket
+        lines.append(f"• *{ticker}* ({label}) — beli {_fmt_rp(entry)}, sekarang {_fmt_rp(close)}")
+        lines.append(f"  {pnl_txt}")
+        lines.append(f"  Status: {status}")
+    return lines
+
+
 # ------------------------------------------------------------------- Laporan
 def _fmt_rp(v: float) -> str:
     return f"Rp {v:,.0f}".replace(",", ".")
@@ -364,6 +494,11 @@ def build_accumulation_report(force: bool = False) -> Optional[str]:
         "📊 *AKUMULASI BULANAN* 📊",
         f"_{now:%B %Y} — kantong Value (mid-long) & Dividen (long)_",
         "Pembagian dana saham: Swing 40% | Value 40% | Dividen 20%.",
+    ]
+    pos_lines = evaluate_positions()
+    if pos_lines:
+        lines += ["", "📌 *POSISI KAMU*"] + pos_lines
+    lines += [
         "",
         f"🏷️ *KANDIDAT VALUE* (maks {MAX_SHOWN})",
     ]
