@@ -67,11 +67,11 @@ TV_DIV_COLUMNS = [
     "SMA200", "beta_1_year", "Perf.3M", "dividends_yield_fy",
 ]
 DIV_MIN_PRICE = 50
-DIV_MAX_PRICE = 3000
+DIV_MAX_PRICE = 5000  # dinaikkan Irgi 2026-11-26 (dari 3.000) agar bank besar bisa masuk radar
 DIV_MIN_ROE = 10.0
 DIV_MIN_MARKET_CAP = 100_000_000_000      # Rp100 M
 DIV_MIN_TURNOVER = 1_000_000_000          # Rp1 M
-DIV_MAX_BETA = 0.8
+DIV_MAX_BETA = 0.9  # keputusan Irgi 2026-11-26 (dari 0,8): basis beta_1_year TV lebih galak dari Beta 3 thn Stockbit
 DIV_MIN_PERF3M = -10.0
 DIV_MAX_PERF3M = 10.0
 DIV_PREFILTER_MIN_FY_YIELD = 3.0          # pra-saring kasar TradingView
