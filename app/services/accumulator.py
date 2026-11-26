@@ -81,6 +81,7 @@ DIV_MIN_PAYOUT = 30.0
 DIV_MAX_PAYOUT = 100.0
 DIV_PAYOUT_WARN = 90.0                    # >= ini: catatan "penyangga tipis"
 DIV_MIN_PAID_YEARS = 3                    # dari 4 tahun terakhir
+DIV_MEGA_CAP = 100_000_000_000_000        # Rp100 T: ambang "saham raksasa" (keputusan Irgi 2026-11-26)
 
 
 def _num(row: Dict[str, Any], key: str) -> Optional[float]:
@@ -304,7 +305,13 @@ def scan_dividend_pocket() -> Dict[str, Any]:
             continue
         if turnover <= DIV_MIN_TURNOVER:
             continue
-        if close < sma200:
+        # Gerbang MA200: harga di bawah MA200 ditolak, KECUALI saham raksasa
+        # (market cap >= Rp100 T) yang seluruh saringan kualitas lain lolos —
+        # keputusan Irgi 2026-11-26: untuk emiten sebesar itu, di bawah MA200
+        # umumnya diskon pasar (yield justru membesar), bukan kerusakan
+        # perusahaan. Kandidat seperti ini ditandai dan WAJIB dibeli bertahap.
+        below_ma200 = close < sma200
+        if below_ma200 and mcap < DIV_MEGA_CAP:
             continue
         if beta >= DIV_MAX_BETA:
             continue
@@ -313,7 +320,7 @@ def scan_dividend_pocket() -> Dict[str, Any]:
         if fy_yield is None or fy_yield < DIV_PREFILTER_MIN_FY_YIELD:
             continue
         pre.append({"ticker": ticker, "close": close, "roe": roe,
-                    "fy_yield": fy_yield})
+                    "fy_yield": fy_yield, "below_ma200": below_ma200})
     pre.sort(key=lambda c: c["fy_yield"], reverse=True)
     logger.info(f"[AKUMULASI] Kantong DIVIDEN: {len(pre)} lolos pra-saring, verifikasi maks {DIV_MAX_VERIFY}.")
 
@@ -342,6 +349,7 @@ def scan_dividend_pocket() -> Dict[str, Any]:
             "paid_years": data["paid_years"],
             "payout_pct": payout,
             "special_note": data["special_note"],
+            "below_ma200": cand.get("below_ma200", False),
         })
         verified.append(cand)
     verified.sort(key=lambda c: c["yield_pct"], reverse=True)
@@ -520,6 +528,8 @@ def build_accumulation_report(force: bool = False) -> Optional[str]:
                 f"• *{c['ticker']}* {_fmt_rp(c['close'])} — Yield {c['yield_pct']:.1f}% | "
                 f"Payout {payout_txt} | ROE {c['roe']:.0f}% | Bayar {c['paid_years']}/4 thn"
             )
+            if c.get("below_ma200"):
+                lines.append("  📉 Sedang di bawah MA200 (diskon pasar; pengecualian saham raksasa). Beli WAJIB bertahap, siap merah lebih dalam dulu.")
             if c["special_note"]:
                 lines.append("  ⚠️ Ada komponen dividen jumbo/special dalam 12 bulan terakhir; yield tahun depan bisa lebih rendah.")
             if c["payout_pct"] is not None and c["payout_pct"] >= DIV_PAYOUT_WARN:
